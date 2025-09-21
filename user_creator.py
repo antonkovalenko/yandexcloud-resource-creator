@@ -155,10 +155,8 @@ class UserCreator:
             operation_id = data['id']
             operation_description = f"folder creation for {folder_name}"
             # Poll the operation until it's complete
-            operation_response = self.poll_operation(operation_id, operation_description)
-            
-            if folder_id is None:
-                folder_id = operation_response['id']
+            operation_response = self.poll_operation(operation_id, operation_description)            
+            folder_id = operation_response['id']
             logger.info(f"Folder created successfully: {folder_name} (ID: {folder_id})")
             return folder_id
             
@@ -196,6 +194,152 @@ class UserCreator:
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to grant access for user {user_id} to folder {folder_id}: {e} {response.text}")
             raise UserCreationError(f"Access grant failed: {e}")
+    
+    def grant_cloud_access(self, cloud_id: str, user_id: str, role_id: str = 'editor') -> None:
+        """Grant access to a cloud for a user"""
+        url = f"https://resource-manager.api.cloud.yandex.net/resource-manager/v1/clouds/{cloud_id}:updateAccessBindings"
+        
+        payload = {
+            "accessBindingDeltas": [
+                {
+                    "action": "ADD",
+                    "accessBinding": {
+                        "roleId": role_id,
+                        "subject": {
+                            "id": user_id,
+                            "type": "userAccount"
+                        }
+                    }
+                }
+            ]
+        }
+        
+        try:
+            response = self.session.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'error' in data:
+                logger.error(f"Failed to grant cloud access for user {user_id} to cloud {cloud_id}: {data['error']}")
+                raise UserCreationError(f"Cloud access grant failed: {data['error']['message']}")
+            
+            # Get operation ID and poll until completion
+            operation_id = data['id']
+            operation_description = f"cloud access grant for user {user_id} to cloud {cloud_id}"
+            
+            # Poll the operation until it's complete
+            self.poll_operation(operation_id, operation_description)
+            
+            logger.info(f"Cloud access granted successfully: user {user_id} -> role {role_id} -> cloud {cloud_id}")
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to grant cloud access for user {user_id} to cloud {cloud_id}: {e} {response.text}")
+            raise UserCreationError(f"Cloud access grant failed: {e}")
+    
+    def create_vpc_with_subnets(self, folder_id: str, network_name: str = None, description: str = None) -> str:
+        """Create a VPC network with 3 subnets in different zones"""
+        if not network_name:
+            network_name = f"vpc-network-{folder_id}"
+        if not description:
+            description = f"VPC network for folder {folder_id}"
+        
+        # Create the network first
+        network_id = self._create_network(folder_id, network_name, description)
+        
+        # Create 3 subnets in different zones
+        zones = ["ru-central1-a", "ru-central1-b", "ru-central1-d"]
+        subnet_ids = []
+        
+        for i, zone in enumerate(zones, 1):
+            subnet_name = f"{network_name}-subnet-{zone}"
+            subnet_description = f"Subnet in {zone} for {network_name}"
+            cidr_block = f"192.168.{i}.0/24"  # 192.168.1.0/24, 192.168.2.0/24, 192.168.3.0/24
+            
+            subnet_id = self._create_subnet(
+                folder_id=folder_id,
+                network_id=network_id,
+                zone_id=zone,
+                name=subnet_name,
+                description=subnet_description,
+                cidr_block=cidr_block
+            )
+            subnet_ids.append(subnet_id)
+        
+        logger.info(f"VPC network created successfully: {network_name} (ID: {network_id}) with subnets: {subnet_ids}")
+        return network_id
+    
+    def _create_network(self, folder_id: str, name: str, description: str) -> str:
+        """Create a VPC network"""
+        url = "https://vpc.api.cloud.yandex.net/vpc/v1/networks"
+        
+        payload = {
+            "folderId": folder_id,
+            "name": name,
+            "description": description,
+            "labels": {}
+        }
+        
+        try:
+            response = self.session.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'error' in data:
+                logger.error(f"Failed to create network {name}: {data['error']}")
+                raise UserCreationError(f"Network creation failed: {data['error']['message']}")
+            
+            # Get operation ID and poll until completion
+            operation_id = data['id']
+            operation_description = f"network creation for {name}"
+            
+            # Poll the operation until it's complete
+            operation_response = self.poll_operation(operation_id, operation_description)
+            
+            network_id = operation_response['id']
+            logger.info(f"Network created successfully: {name} (ID: {network_id})")
+            return network_id
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to create network {name}: {e} {response.text}")
+            raise UserCreationError(f"Network creation failed: {e}")
+    
+    def _create_subnet(self, folder_id: str, network_id: str, zone_id: str, name: str, description: str, cidr_block: str) -> str:
+        """Create a subnet in a specific zone"""
+        url = "https://vpc.api.cloud.yandex.net/vpc/v1/subnets"
+        
+        payload = {
+            "folderId": folder_id,
+            "name": name,
+            "description": description,
+            "labels": {},
+            "networkId": network_id,
+            "zoneId": zone_id,
+            "v4CidrBlocks": [cidr_block]
+        }
+        
+        try:
+            response = self.session.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'error' in data:
+                logger.error(f"Failed to create subnet {name}: {data['error']}")
+                raise UserCreationError(f"Subnet creation failed: {data['error']['message']}")
+            
+            # Get operation ID and poll until completion
+            operation_id = data['id']
+            operation_description = f"subnet creation for {name} in {zone_id}"
+            
+            # Poll the operation until it's complete
+            operation_response = self.poll_operation(operation_id, operation_description)
+            
+            subnet_id = operation_response['id']
+            logger.info(f"Subnet created successfully: {name} (ID: {subnet_id}) in zone {zone_id} with CIDR {cidr_block}")
+            return subnet_id
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to create subnet {name}: {e} {response.text}")
+            raise UserCreationError(f"Subnet creation failed: {e}")
     
     def poll_operation(self, operation_id: str, operation_description: str = "operation") -> dict:
         """Poll operation status until completion"""

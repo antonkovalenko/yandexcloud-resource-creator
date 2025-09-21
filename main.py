@@ -219,14 +219,34 @@ def main():
                         user_id=user_id,
                         role_id='editor'
                     )
+
+                    # Grant resource-manager.clouds.member role to the user we have created to the cloud
+                    user_creator.grant_cloud_access(
+                        cloud_id=args.cloud_id,
+                        user_id=user_id,
+                        role_id='resource-manager.clouds.member'
+                    )                    
                     
                     logger.info(f"Folder and access created for user {username}")
-                    
+                                       
                 except UserCreationError as e:
                     logger.error(f"Failed to create folder/access for user {username}: {e}")
                     # Continue with user creation even if folder creation fails
                     folder_id = None
-                
+
+                # Create virtual private network with 3 subnets in the just created folder
+                try:
+                    network_id = user_creator.create_vpc_with_subnets(
+                        folder_id=folder_id,
+                        network_name=f"vpc-" + given_name.lower() + "-" + family_name.lower(),
+                        description=f"VPC network for user {username}"
+                    )
+                    logger.info(f"VPC network created for user {username}: {network_id}")
+                    
+                except UserCreationError as e:
+                    logger.error(f"Failed to create VPC for user {username}: {e}")
+                    # Continue with user creation even if VPC creation fails
+
                 created_users.append({
                     'id': user_id,
                     'username': username,
