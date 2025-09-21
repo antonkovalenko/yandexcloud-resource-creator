@@ -7,9 +7,10 @@ using the Yandex Cloud organization-manager and resource-manager APIs.
 """
 
 import logging
+import re
 import requests
-import time
 import sys
+import time
 from typing import Tuple
 
 
@@ -23,7 +24,7 @@ class UserCreationError(Exception):
 
 class UserCreator:
     """Handles user creation, folder creation, and access management in Yandex Cloud"""
-    
+    VALID_OWN_PASSWORD = 'YdbAdmin$2025'
     def __init__(self, iam_token: str):
         self.iam_token = iam_token
         self.session = requests.Session()
@@ -236,7 +237,7 @@ class UserCreator:
             logger.error(f"Failed to grant cloud access for user {user_id} to cloud {cloud_id}: {e} {response.text}")
             raise UserCreationError(f"Cloud access grant failed: {e}")
     
-    def create_vpc_with_subnets(self, folder_id: str, network_name: str = None, description: str = None) -> str:
+    def create_vpc_with_subnets(self, folder_id: str, network_name: str = None, description: str = None) -> tuple:
         """Create a VPC network with 3 subnets in different zones"""
         if not network_name:
             network_name = f"vpc-network-{folder_id}"
@@ -266,7 +267,7 @@ class UserCreator:
             subnet_ids.append(subnet_id)
         
         logger.info(f"VPC network created successfully: {network_name} (ID: {network_id}) with subnets: {subnet_ids}")
-        return network_id
+        return network_id, subnet_ids
     
     def _create_network(self, folder_id: str, name: str, description: str) -> str:
         """Create a VPC network"""
@@ -341,11 +342,98 @@ class UserCreator:
             logger.error(f"Failed to create subnet {name}: {e} {response.text}")
             raise UserCreationError(f"Subnet creation failed: {e}")
     
+    def create_ydb_database(self, folder_id: str, network_id: str, subnet_ids: list, database_name: str = None, description: str = None) -> str:
+        """Create a YDB database with the specified configuration"""
+        if not database_name:
+            database_name = f"ydb-database-{folder_id}"
+        if not description:
+            description = f"YDB database for folder {folder_id}"
+        
+        # Validate resource name pattern: /|[a-zA-Z]([-_a-zA-Z0-9]{0,61}[a-zA-Z0-9])?/
+        if not self._is_valid_ydb_resource_name(database_name):
+            raise UserCreationError(f"Invalid database name '{database_name}'. Must match pattern /|[a-zA-Z]([-_a-zA-Z0-9]{{0,61}}[a-zA-Z0-9])?/")
+        
+        url = "https://ydb.api.cloud.yandex.net/ydb/v1/databases"
+        
+        payload = {
+            "folderId": folder_id,
+            "name": database_name,
+            "description": description,
+            "resourcePresetId": "medium",
+            "storageConfig": {
+                "storageOptions": [
+                    {
+                        "storageTypeId": "ssd",
+                        "groupCount": "1"
+                    }
+                ]
+            },
+            "scalePolicy": {
+                "fixedScale": {
+                    "size": "1"
+                }
+            },
+            "networkId": network_id,
+            "subnetIds": subnet_ids,
+            "dedicatedDatabase": {
+                "resourcePresetId": "medium",
+                "storageConfig": {
+                    "storageOptions": [
+                        {
+                            "storageTypeId": "ssd",
+                            "groupCount": "1"
+                        }
+                    ]
+                },
+                "scalePolicy": {
+                    "fixedScale": {
+                        "size": "1"
+                    }
+                },
+                "networkId": network_id,
+                "subnetIds": subnet_ids,
+                "assignPublicIps": False
+            },
+            "assignPublicIps": False,
+            "labels": {}
+        }
+        
+        try:
+            response = self.session.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'error' in data:
+                logger.error(f"Failed to create YDB database {database_name}: {data['error']}")
+                raise UserCreationError(f"YDB database creation failed: {data['error']['message']}")
+            
+            # Get operation ID and poll until completion
+            operation_id = data['id']
+            operation_description = f"YDB database creation for {database_name}"
+            
+            # Poll the operation until it's complete
+            operation_response = self.poll_operation(operation_id, operation_description)
+            
+            database_id = operation_response['id']
+            logger.info(f"YDB database created successfully: {database_name} (ID: {database_id})")
+            return database_id
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to create YDB database {database_name}: {e} {response.text}")
+            raise UserCreationError(f"YDB database creation failed: {e}")
+    
+    def _is_valid_ydb_resource_name(self, name: str) -> bool:
+        """Validate YDB resource name pattern: /|[a-zA-Z]([-_a-zA-Z0-9]{0,61}[a-zA-Z0-9])?/"""
+        # Pattern: start with letter, then 0-61 chars of letters/numbers/dash/underscore, end with letter or number
+        pattern = r'^[a-zA-Z]([-_a-zA-Z0-9]{0,61}[a-zA-Z0-9])?$'
+        return bool(re.match(pattern, name))
+    
     def poll_operation(self, operation_id: str, operation_description: str = "operation") -> dict:
         """Poll operation status until completion"""
         url = f"https://operation.api.cloud.yandex.net/operations/{operation_id}"
         
         logger.info(f"Starting polling for {operation_description} (ID: {operation_id})")
+        start_time = time.time()
         
         while True:
             try:
@@ -360,19 +448,22 @@ class UserCreator:
                     # Operation finished, check for errors
                     if 'error' in data and data['error']:
                         error = data['error']
-                        logger.error(f"Operation {operation_id} failed: "
+                        elapsed_time = time.time() - start_time
+                        logger.error(f"Operation {operation_id} failed after {elapsed_time:.2f}s: "
                                    f"status={error.get('code', 'unknown')}, "
                                    f"message='{error.get('message', 'no message')}', "
                                    f"details={error.get('details', {})}")
                         raise UserCreationError(f"Operation {operation_description} failed: {error.get('message', 'Unknown error')}")
                     else:
-                        logger.info(f"Operation {operation_description} completed successfully (ID: {operation_id})")
+                        elapsed_time = time.time() - start_time
+                        logger.info(f"Operation {operation_description} completed successfully (ID: {operation_id}) in {elapsed_time:.2f}s")
                         return data.get('response', {})
                 else:
                     # Operation not done yet, check for errors
                     if 'error' in data and data['error']:
                         error = data['error']
-                        logger.warning(f"Operation {operation_id} has failures during execution: "
+                        elapsed_time = time.time() - start_time
+                        logger.warning(f"Operation {operation_id} has failures during execution after {elapsed_time:.2f}s: "
                                      f"status={error.get('code', 'unknown')}, "
                                      f"message='{error.get('message', 'no message')}', "
                                      f"details={error.get('details', {})}")

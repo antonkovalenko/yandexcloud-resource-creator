@@ -235,13 +235,30 @@ def main():
                     folder_id = None
 
                 # Create virtual private network with 3 subnets in the just created folder
+                network_id = None
+                subnet_ids = []
                 try:
-                    network_id = user_creator.create_vpc_with_subnets(
+                    network_id, subnet_ids = user_creator.create_vpc_with_subnets(
                         folder_id=folder_id,
                         network_name=f"vpc-" + given_name.lower() + "-" + family_name.lower(),
                         description=f"VPC network for user {username}"
                     )
                     logger.info(f"VPC network created for user {username}: {network_id}")
+                    
+                    # Create YDB database using the created network and subnets
+                    try:
+                        database_id = user_creator.create_ydb_database(
+                            folder_id=folder_id,
+                            network_id=network_id,
+                            subnet_ids=subnet_ids,
+                            database_name=f"ydb-" + given_name.lower() + "-" + family_name.lower(),
+                            description=f"YDB database for user {username}"
+                        )
+                        logger.info(f"YDB database created for user {username}: {database_id}")
+                        
+                    except UserCreationError as e:
+                        logger.error(f"Failed to create YDB database for user {username}: {e}")
+                        # Continue with user creation even if YDB creation fails
                     
                 except UserCreationError as e:
                     logger.error(f"Failed to create VPC for user {username}: {e}")
@@ -252,6 +269,9 @@ def main():
                     'username': username,
                     'full_name': full_name,
                     'password': password,
+                    'network_id': network_id,
+                    'subnet_ids': subnet_ids,
+                    'database_id': database_id,
                     'folder_id': folder_id
                 })
                 
