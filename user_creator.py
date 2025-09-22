@@ -24,6 +24,9 @@ class UserCreationError(Exception):
 
 class UserCreator:
     """Handles user creation, folder creation, and access management in Yandex Cloud"""
+    # Availability zones used across VPC/subnet creation and checks
+    ZONES = ["ru-central1-a", "ru-central1-b", "ru-central1-d"]
+    MAX_POLL_RETRIES = 5
     VALID_OWN_PASSWORD = 'YdbAdmin$2025'
     def __init__(self, iam_token: str):
         self.iam_token = iam_token
@@ -248,7 +251,7 @@ class UserCreator:
         network_id = self._create_network(folder_id, network_name, description)
         
         # Create 3 subnets in different zones
-        zones = ["ru-central1-a", "ru-central1-b", "ru-central1-d"]
+        zones = self.ZONES
         subnet_ids = []
         
         for i, zone in enumerate(zones, 1):
@@ -421,12 +424,205 @@ class UserCreator:
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to create YDB database {database_name}: {e} {response.text}")
             raise UserCreationError(f"YDB database creation failed: {e}")
+
+    def start_ydb_database(self, folder_id: str, network_id: str, subnet_ids: list, database_name: str = None, description: str = None) -> str:
+        """Start YDB database creation and return operation ID without waiting for completion"""
+        if not database_name:
+            database_name = f"ydb-database-{folder_id}"
+        if not description:
+            description = f"YDB database for folder {folder_id}"
+
+        if not self._is_valid_ydb_resource_name(database_name):
+            raise UserCreationError(f"Invalid database name '{database_name}'. Must match pattern /|[a-zA-Z]([-_a-zA-Z0-9]{0,61}[a-zA-Z0-9])?/")
+
+        url = "https://ydb.api.cloud.yandex.net/ydb/v1/databases"
+
+        payload = {
+            "folderId": folder_id,
+            "name": database_name,
+            "description": description,
+            "resourcePresetId": "medium",
+            "storageConfig": {
+                "storageOptions": [
+                    {"storageTypeId": "ssd", "groupCount": "1"}
+                ]
+            },
+            "scalePolicy": {"fixedScale": {"size": "1"}},
+            "networkId": network_id,
+            "subnetIds": subnet_ids,
+            "dedicatedDatabase": {
+                "resourcePresetId": "medium",
+                "storageConfig": {"storageOptions": [{"storageTypeId": "ssd", "groupCount": "1"}]},
+                "scalePolicy": {"fixedScale": {"size": "1"}},
+                "networkId": network_id,
+                "subnetIds": subnet_ids,
+                "assignPublicIps": False,
+            },
+            "assignPublicIps": False,
+            "labels": {},
+        }
+
+        try:
+            response = self.session.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+            if 'error' in data:
+                logger.error(f"Failed to start YDB database {database_name}: {data['error']}")
+                raise UserCreationError(f"YDB database start failed: {data['error']['message']}")
+
+            operation_id = data['id']
+            logger.info(f"YDB create operation started for {database_name} (op: {operation_id})")
+            return operation_id
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to start YDB database {database_name}: {e} {response.text}")
+            raise UserCreationError(f"YDB database start failed: {e}")
+
+    def get_operation_status(self, operation_id: str) -> dict:
+        """Fetch operation status once (non-blocking) and return the JSON."""
+        url = f"https://operation.api.cloud.yandex.net/operations/{operation_id}"
+        for attempt in range(1, self.MAX_POLL_RETRIES + 1):
+            try:
+                response = self.session.get(url)
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.RequestException as e:
+                if attempt >= self.MAX_POLL_RETRIES:
+                    logger.error(f"Failed to fetch operation status for {operation_id} after {attempt} attempts: {e}")
+                    raise UserCreationError(f"Operation status fetch failed: {e}")
+                delay = 2 ** (attempt - 1)
+                logger.warning(f"Fetch status retry {attempt}/{self.MAX_POLL_RETRIES} for op {operation_id} in {delay}s due to error: {e}")
+                time.sleep(delay)
     
     def _is_valid_ydb_resource_name(self, name: str) -> bool:
         """Validate YDB resource name pattern: /|[a-zA-Z]([-_a-zA-Z0-9]{0,61}[a-zA-Z0-9])?/"""
         # Pattern: start with letter, then 0-61 chars of letters/numbers/dash/underscore, end with letter or number
         pattern = r'^[a-zA-Z]([-_a-zA-Z0-9]{0,61}[a-zA-Z0-9])?$'
         return bool(re.match(pattern, name))
+    
+    def list_folders(self, cloud_id: str) -> list:
+        """List all folders in a cloud"""
+        url = f"https://resource-manager.api.cloud.yandex.net/resource-manager/v1/folders"
+        
+        params = {
+            'cloudId': cloud_id
+        }
+        
+        try:
+            response = self.session.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'error' in data:
+                logger.error(f"Failed to list folders in cloud {cloud_id}: {data['error']}")
+                raise UserCreationError(f"Failed to list folders: {data['error']['message']}")
+            
+            folders = data.get('folders', [])
+            logger.info(f"Found {len(folders)} folders in cloud {cloud_id}")
+            return folders
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to list folders in cloud {cloud_id}: {e}")
+            raise UserCreationError(f"Failed to list folders: {e}")
+    
+    def list_networks(self, folder_id: str) -> list:
+        """List all networks in a folder"""
+        url = "https://vpc.api.cloud.yandex.net/vpc/v1/networks"
+        #always return list with this only element enp405qc235ru1ci9vdj
+        folder_id = 'b1gofk0fh5qlc1plb7oe'
+        
+        params = {
+            'folderId': folder_id
+        }
+        try:
+            response = self.session.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'error' in data:
+                logger.error(f"Failed to list networks in folder {folder_id}: {data['error']}")
+                raise UserCreationError(f"Failed to list networks: {data['error']['message']}")
+            
+            networks = data.get('networks', [])
+            logger.info(f"Found {len(networks)} networks in folder {folder_id}")
+            return networks
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to list networks in folder {folder_id}: {e}")
+            raise UserCreationError(f"Failed to list networks: {e}")
+    
+    def list_subnets(self, network_id: str) -> list:
+        """List all subnets in a network"""
+        url = f"https://vpc.api.cloud.yandex.net/vpc/v1/networks/{network_id}/subnets"
+        
+        try:
+            response = self.session.get(url)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'error' in data:
+                logger.error(f"Failed to list subnets for network {network_id}: {data['error']}")
+                raise UserCreationError(f"Failed to list subnets: {data['error']['message']}")
+            
+            subnets = data.get('subnets', [])
+            logger.info(f"Found {len(subnets)} subnets in network {network_id}")
+            return subnets
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to list subnets for network {network_id}: {e}")
+            raise UserCreationError(f"Failed to list subnets: {e}")
+    
+    def check_existing_vpc(self, folder_id: str) -> tuple:
+        """Check if folder has existing VPC with subnets in all required zones"""
+        required_zones = self.ZONES
+        
+        try:
+            # List networks in the folder
+            networks = self.list_networks(folder_id)
+            
+            if not networks:
+                logger.info(f"No networks found in folder {folder_id}")
+                return None, []
+            
+            # Check each network for complete subnet coverage
+            for network in networks:
+                network_id = network['id']
+                network_name = network['name']
+                
+                # Get subnets for this network
+                subnets = self.list_subnets(network_id)
+                
+                if not subnets:
+                    logger.info(f"Network {network_name} (ID: {network_id}) has no subnets")
+                    continue
+                
+                # Check if we have subnets in all required zones
+                subnet_zones = set()
+                subnet_ids = []
+                
+                for subnet in subnets:
+                    zone_id = subnet['zoneId']
+                    subnet_zones.add(zone_id)
+                    subnet_ids.append(subnet['id'])
+                
+                # Check if all required zones are covered
+                if subnet_zones.issuperset(set(required_zones)):
+                    logger.info(f"Found existing VPC {network_name} (ID: {network_id}) with subnets in all required zones: {subnet_zones}")
+                    return network_id, subnet_ids
+                else:
+                    missing_zones = set(required_zones) - subnet_zones
+                    logger.info(f"Network {network_name} (ID: {network_id}) missing subnets in zones: {missing_zones}")
+            
+            logger.info(f"No complete VPC found in folder {folder_id}")
+            return None, []
+            
+        except UserCreationError:
+            # Re-raise UserCreationError as-is
+            raise
+        except Exception as e:
+            logger.error(f"Error checking existing VPC in folder {folder_id}: {e}")
+            raise UserCreationError(f"Failed to check existing VPC: {e}")
     
     def poll_operation(self, operation_id: str, operation_description: str = "operation") -> dict:
         """Poll operation status until completion"""
@@ -437,9 +633,23 @@ class UserCreator:
         
         while True:
             try:
-                response = self.session.get(url)
-                response.raise_for_status()
-                data = response.json()
+                # GET with retries and backoff
+                last_error = None
+                for attempt in range(1, self.MAX_POLL_RETRIES + 1):
+                    try:
+                        response = self.session.get(url)
+                        response.raise_for_status()
+                        data = response.json()
+                        break
+                    except requests.exceptions.RequestException as e:
+                        last_error = e
+                        if attempt >= self.MAX_POLL_RETRIES:
+                            raise
+                        delay = 2 ** (attempt - 1)
+                        logger.warning(
+                            f"Poll retry {attempt}/{self.MAX_POLL_RETRIES} for {operation_description} (ID: {operation_id}) in {delay}s due to error: {e}"
+                        )
+                        time.sleep(delay)
                 
                 done = data.get('done', False)
                 

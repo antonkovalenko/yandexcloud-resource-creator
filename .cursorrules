@@ -1,0 +1,3 @@
+- Always put imports at the top of the file (module scope), never inside functions/methods.
+- For Python, keep imports grouped and ordered (use isort), and follow Ruff E402.
+- Preserve existing indentation style; do not reformat unrelated
