@@ -22,7 +22,7 @@ from validators import (
     validate_cloud_id
 )
 from user_creator import UserCreator, UserCreationError
-from modes import run_users_mode, run_ydb_mode
+from modes import run_users_mode, run_ydb_mode, run_reset_password_mode, run_generate_load_mode
 
 
 # Configure logging to stdout
@@ -47,9 +47,9 @@ def main():
     # Mode selection
     parser.add_argument(
         '--do',
-        choices=['users', 'ydb'],
+        choices=['users', 'ydb', 'reset-password', 'generate-load'],
         required=True,
-        help='Operation mode: "users" for user creation, "ydb" for YDB database creation'
+        help='Operation mode: "users", "ydb", "reset-password", or "generate-load"'
     )
     
     # User creation mode arguments
@@ -86,12 +86,47 @@ def main():
         help='Cloud id - required for both modes'
     )
     
+    # Reset-password mode arguments
+    parser.add_argument(
+        '--user-ids',
+        required=False,
+        default='',
+        help='Comma-separated list of user IDs to reset password for (optional)'
+    )
+    
     # YDB mode specific arguments
     parser.add_argument(
         '--skip-folder-ids',
         required=False,
         default='',
         help='Comma-separated list of folder IDs to skip during YDB creation'
+    )
+    parser.add_argument(
+        '--create-ydb-in-folders',
+        required=False,
+        default='',
+        help='Comma-separated list of folder IDs to create YDB in (if provided, only these folders are processed)'
+    )
+
+    # Generate-load mode arguments
+    parser.add_argument(
+        '--folder-ids',
+        required=False,
+        default='',
+        help='Comma-separated list of folder IDs to target (generate-load mode)'
+    )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        required=False,
+        default=16,
+        help='Parallel commands per batch (1-32) for generate-load mode'
+    )
+    parser.add_argument(
+        '--output-dir',
+        required=False,
+        default='.',
+        help='Existing writable directory to write bash scripts (generate-load mode)'
     )
     
     args = parser.parse_args()
@@ -110,6 +145,10 @@ def main():
             run_users_mode(args, user_creator)
         elif args.do == 'ydb':
             run_ydb_mode(args, user_creator)
+        elif args.do == 'reset-password':
+            run_reset_password_mode(args, user_creator)
+        elif args.do == 'generate-load':
+            run_generate_load_mode(args, user_creator)
         
         
     except ValueError as e:

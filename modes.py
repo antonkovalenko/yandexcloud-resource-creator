@@ -114,80 +114,84 @@ def run_users_mode(args, user_creator: UserCreator) -> None:
     )
 
     name_generator = NameGenerator()
-    created_users = []
+    created_count = 0
 
-    for i in range(args.num_users):
-        try:
-            given_name, family_name = name_generator.generate_unique_name()
-            full_name = f"{given_name} {family_name}"
+    # Open file once, write header, then stream rows as users are created
+    f = None
+    try:
+        f = open(args.created_users_file, 'w')
+        f.write("id,username,password\n")
+        f.flush()
 
-            username = generate_username(given_name, family_name, args.domain)
-            email = username
-            phone_number = f"+1555{i:07d}"
-
-            password, generation_proof = user_creator.generate_password()
-
-            user_id = user_creator.create_user(
-                userpool_id=args.userpool_id,
-                username=username,
-                full_name=full_name,
-                given_name=given_name,
-                family_name=family_name,
-                email=email,
-                phone_number=phone_number,
-                password=password,
-                generation_proof=generation_proof,
-            )
-
-            folder_id = None
+        for i in range(args.num_users):
             try:
-                folder_id = user_creator.create_folder(
-                    cloud_id=args.cloud_id,
-                    folder_name=given_name.lower() + "-" + family_name.lower(),
-                    description=f"Personal folder for user {full_name}",
+                given_name, family_name = name_generator.generate_unique_name()
+                full_name = f"{given_name} {family_name}"
+                
+                username = generate_username(given_name, family_name, args.domain)
+                email = username
+                phone_number = f"+1555{i:07d}"
+                
+                password, generation_proof = user_creator.generate_password()
+                
+                user_id = user_creator.create_user(
+                    userpool_id=args.userpool_id,
+                    username=username,
+                    full_name=full_name,
+                    given_name=given_name,
+                    family_name=family_name,
+                    email=email,
+                    phone_number=phone_number,
+                    password=password,
+                    generation_proof=generation_proof,
                 )
+                
+                folder_id = None
+                try:
+                    folder_id = user_creator.create_folder(
+                        cloud_id=args.cloud_id,
+                        folder_name=given_name.lower() + "-" + family_name.lower(),
+                        description=f"Personal folder for user {full_name}",
+                    )
+                    
+                    user_creator.grant_folder_access(
+                        folder_id=folder_id,
+                        user_id=user_id,
+                        role_id='editor',
+                    )
+                    
+                    user_creator.grant_cloud_access(
+                        cloud_id=args.cloud_id,
+                        user_id=user_id,
+                        role_id='resource-manager.clouds.member',
+                    )
+                    
+                    logger.info(f"Folder and access created for user {username}")
+                    
+                except UserCreationError as e:
+                    logger.error(f"Failed to create folder/access for user {username}: {e}")
 
-                user_creator.grant_folder_access(
-                    folder_id=folder_id,
-                    user_id=user_id,
-                    role_id='editor',
-                )
-
-                user_creator.grant_cloud_access(
-                    cloud_id=args.cloud_id,
-                    user_id=user_id,
-                    role_id='resource-manager.clouds.member',
-                )
-
-                logger.info(f"Folder and access created for user {username}")
-
+                # Write CSV line immediately so progress is not lost
+                f.write(f"{user_id},{username},{password}\n")
+                f.flush()
+                created_count += 1
+                
+                logger.info(f"Created user {i+1}/{args.num_users}: {username} ({full_name}) id: {user_id}")
+                
             except UserCreationError as e:
-                logger.error(f"Failed to create folder/access for user {username}: {e}")
+                logger.error(f"Failed to create user {i+1}: {e}")
+                continue
+    except Exception as e:
+        logger.error(f"Failed to open or write to file {args.created_users_file}: {e}")
+        sys.exit(1)
+    finally:
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
 
-            created_users.append({
-                'id': user_id,
-                'username': username,
-                'password': password
-            })
-
-            logger.info(f"Created user {i+1}/{args.num_users}: {username} ({full_name}) id: {user_id}")
-
-        except UserCreationError as e:
-            logger.error(f"Failed to create user {i+1}: {e}")
-            continue
-
-    logger.info(f"User creation completed. Successfully created {len(created_users)} users")
-
-    if created_users:
-        try:
-            with open(args.created_users_file, 'w') as f:
-                writer = csv.DictWriter(f, created_users[0].keys())
-                writer.writeheader()
-                writer.writerows(created_users)
-            logger.info(f"Created users written to {args.created_users_file}")
-        except Exception as e:
-            logger.error(f"Failed to write created users to file: {e}")
-            sys.exit(1)
+    logger.info(f"User creation completed. Successfully created {created_count} users. Output: {args.created_users_file}")
 
 
 def run_ydb_mode(args, user_creator: UserCreator) -> None:
@@ -200,14 +204,22 @@ def run_ydb_mode(args, user_creator: UserCreator) -> None:
         skip_folder_ids = set(folder_id.strip() for folder_id in args.skip_folder_ids.split(','))
         logger.info(f"Will skip folders: {skip_folder_ids}")
 
-    folders = user_creator.list_folders(args.cloud_id)
+    # Determine which folders to process
+    target_folders = []
+    if getattr(args, 'create_ydb_in_folders', None):
+        ids = [fid.strip() for fid in args.create_ydb_in_folders.split(',') if fid.strip()]
+        logger.info(f"Will create YDB only in specified folders: {ids}")
+        # Build minimal folder objects from IDs; names unknown so set to ID
+        target_folders = [{'id': fid, 'name': fid} for fid in ids]
+    else:
+        target_folders = user_creator.list_folders(args.cloud_id)
 
     created_databases = 0
     skipped_folders = 0
     max_concurrent = 5
     pending_ops = []  # list of dicts: {folder_id, folder_name, operation_id}
 
-    for folder in folders:
+    for folder in target_folders:
         folder_id = folder['id']
         folder_name = folder['name']
 
@@ -217,6 +229,26 @@ def run_ydb_mode(args, user_creator: UserCreator) -> None:
             continue
 
         try:
+            # Skip if folder already has a YDB with storageConfig.storageOptions.groupCount > 1
+            existing_dbs = user_creator.list_ydb_databases_in_folder(folder_id)
+            has_existing_dedicated = False
+            for db in existing_dbs:
+                opts = db.get('storageConfig', {}).get('storageOptions', [])
+                for opt in opts:
+                    try:
+                        group_count = int(opt.get('groupCount', '0'))
+                    except (TypeError, ValueError):
+                        group_count = 0
+                    if group_count > 1:
+                        has_existing_dedicated = True
+                        break
+                if has_existing_dedicated:
+                    break
+            if has_existing_dedicated:
+                logger.info(f"Folder {folder_name} (ID: {folder_id}) already has a dedicated YDB database (groupCount>1). Skipping.")
+                skipped_folders += 1
+                continue
+
             network_id, subnet_ids = user_creator.check_existing_vpc(folder_id)
 
             if network_id and subnet_ids:
@@ -301,5 +333,190 @@ def _poll_pending_ops(user_creator: UserCreator, pending_ops: list) -> int:
         time.sleep(2)
     pending_ops[:] = still_pending
     return successes
+
+
+def run_reset_password_mode(args, user_creator: UserCreator) -> None:
+    # Validate inputs
+    if not args.userpool_id:
+        logger.error("--userpool-id is required for reset-password mode")
+        sys.exit(1)
+
+    validate_userpool_id(args.userpool_id)
+    validate_created_users_file(args.created_users_file)
+
+    # Build username map by listing users (used for output consistency)
+    logger.info(f"Listing users from userpool {args.userpool_id} to build username map")
+    users = user_creator.list_users_in_userpool(args.userpool_id)
+    username_by_id = {u['id']: u.get('username', '') for u in users}
+
+    # Decide target users
+    target_user_ids = []
+    if getattr(args, 'user_ids', None):
+        target_user_ids = [u.strip() for u in args.user_ids.split(',') if u.strip()]
+        logger.info(f"Resetting password for provided {len(target_user_ids)} user(s)")
+    else:
+        target_user_ids = list(username_by_id.keys())
+        logger.info(f"Collected {len(target_user_ids)} user(s) to reset from userpool")
+
+    successes = 0
+    failures = 0
+
+    f = None
+    try:
+        # Open output file once and stream results line-by-line (same format as users mode)
+        f = open(args.created_users_file, 'w')
+        f.write("id,username,password\n")
+        f.flush()
+
+        for user_id in target_user_ids:
+            try:
+                # Generate a new password
+                password, generation_proof = user_creator.generate_password()
+                # Set password for the user
+                user_creator.set_others_password(user_id, password, generation_proof)
+
+                username = username_by_id.get(user_id, '')
+                f.write(f"{user_id},{username},{password}\n")
+                f.flush()
+
+                successes += 1
+            except UserCreationError as e:
+                logger.error(f"Failed to reset password for user {user_id}: {e}")
+                failures += 1
+    except Exception as e:
+        logger.error(f"Failed to open or write to file {args.created_users_file}: {e}")
+        sys.exit(1)
+    finally:
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+    logger.info(f"Password reset completed. Success: {successes}, Failed: {failures}")
+
+
+def _validate_output_dir(path: str) -> None:
+    import os
+    if not path:
+        raise ValueError("output-dir cannot be empty")
+    if not os.path.isdir(path):
+        raise ValueError(f"output-dir {path} is not a directory")
+    if not os.access(path, os.W_OK):
+        raise ValueError(f"output-dir {path} is not writable")
+
+
+def run_generate_load_mode(args, user_creator: UserCreator) -> None:
+    # Validate inputs
+    validate_cloud_id(args.cloud_id)
+    if args.batch_size < 1 or args.batch_size > 32:
+        logger.error("--batch-size must be between 1 and 32")
+        sys.exit(1)
+    try:
+        _validate_output_dir(args.output_dir)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
+
+    # Resolve folders to process
+    if getattr(args, 'folder_ids', None):
+        folder_ids = [fid.strip() for fid in args.folder_ids.split(',') if fid.strip()]
+        folders = [{'id': fid, 'name': fid} for fid in folder_ids]
+        logger.info(f"generate-load: using provided folder IDs: {folder_ids}")
+    else:
+        folders = user_creator.list_folders(args.cloud_id)
+        logger.info(f"generate-load: listed {len(folders)} folders in cloud {args.cloud_id}")
+
+    # Build skip set
+    skip_set = set()
+    if getattr(args, 'skip_folder_ids', None):
+        skip_set = set(fid.strip() for fid in args.skip_folder_ids.split(',') if fid.strip())
+
+    # Open output scripts
+    import os
+    init_path = os.path.join(args.output_dir, 'init.bash')
+    mixed_path = os.path.join(args.output_dir, 'run-mixed-and-select.bash')
+    try:
+        init_f = open(init_path, 'w')
+        mixed_f = open(mixed_path, 'w')
+        init_f.write("#!/usr/bin/env bash\n")
+        mixed_f.write("#!/usr/bin/env bash\n")
+    except Exception as e:
+        logger.error(f"Failed to open output scripts: {e}")
+        sys.exit(1)
+
+    generated = 0
+    try:
+        for folder in folders:
+            folder_id = folder['id']
+            folder_name = folder.get('name', folder_id)
+            if folder_id in skip_set:
+                logger.info(f"generate-load: skipping folder {folder_name} (ID: {folder_id})")
+                continue
+
+            # Find first YDB with storage groups
+            try:
+                dbs = user_creator.list_ydb_databases_in_folder(folder_id)
+            except UserCreationError as e:
+                logger.error(f"generate-load: failed to list YDB in folder {folder_id}: {e}")
+                continue
+
+            target_db = None
+            for db in dbs:
+                opts = db.get('storageConfig', {}).get('storageOptions', [])
+                has_groups = False
+                for opt in opts:
+                    try:
+                        group_count = int(opt.get('groupCount', '0'))
+                    except (TypeError, ValueError):
+                        group_count = 0
+                    if group_count > 0:
+                        has_groups = True
+                        break
+                if has_groups:
+                    target_db = db
+                    break
+
+            if not target_db:
+                logger.info(f"generate-load: no YDB with storage groups found in folder {folder_id}")
+                continue
+
+            db_id = target_db['id']
+            endpoint = target_db.get('endpoint', '')
+
+            # Generate commands
+            init_cmd = (
+                f"ydb --use-metadata-credentials -e {endpoint} -d /ru-central1/{args.cloud_id}/{db_id} "
+                f"workload kv init --auto-partition 0 --max-partitions 1 --min-partitions 1 > init-{db_id} 2>&1 &"
+            )
+            mixed_cmd = (
+                f"ydb --use-metadata-credentials -e {endpoint} -d /ru-central1/{args.cloud_id}/{db_id} "
+                f"workload kv run mixed -t 300 --seconds 3600 > mixed-{db_id} 2>&1 &"
+            )
+            select_cmd = (
+                f"ydb --use-metadata-credentials -e {endpoint} -d /ru-central1/{args.cloud_id}/{db_id} "
+                f"workload kv run select --threads 100 --seconds 3600 --rows 100 > mixed-{db_id} 2>&1 &"
+            )
+
+            init_f.write(init_cmd + "\n")
+            mixed_f.write(mixed_cmd + "\n")
+            mixed_f.write(select_cmd + "\n")
+            generated += 1
+
+    finally:
+        try:
+            init_f.close()
+            mixed_f.close()
+        except Exception:
+            pass
+
+    # Make executable
+    try:
+        os.chmod(init_path, 0o755)
+        os.chmod(mixed_path, 0o755)
+    except Exception as e:
+        logger.warning(f"Failed to make scripts executable: {e}")
+
+    logger.info(f"generate-load: wrote scripts to {args.output_dir}. Databases targeted: {generated}")
 
 

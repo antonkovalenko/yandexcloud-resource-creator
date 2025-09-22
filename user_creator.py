@@ -492,8 +492,64 @@ class UserCreator:
                     logger.error(f"Failed to fetch operation status for {operation_id} after {attempt} attempts: {e}")
                     raise UserCreationError(f"Operation status fetch failed: {e}")
                 delay = 2 ** (attempt - 1)
-                logger.warning(f"Fetch status retry {attempt}/{self.MAX_POLL_RETRIES} for op {operation_id} in {delay}s due to error: {e}")
+                logger.warning(
+                    f"Fetch status retry {attempt}/{self.MAX_POLL_RETRIES} for op {operation_id} in {delay}s due to error: {e}"
+                )
                 time.sleep(delay)
+
+    def list_users_in_userpool(self, userpool_id: str, page_size: int = 1000) -> list:
+        """List users in a userpool, handling pagination."""
+        url = "https://organization-manager.api.cloud.yandex.net/organization-manager/v1/idp/users"
+        users = []
+        page_token = None
+        while True:
+            params = {
+                'userpoolId': userpool_id,
+                'pageSize': str(page_size),
+            }
+            if page_token:
+                params['pageToken'] = page_token
+            try:
+                response = self.session.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+                if 'error' in data:
+                    logger.error(f"Failed to list users in userpool {userpool_id}: {data['error']}")
+                    raise UserCreationError(f"List users failed: {data['error']['message']}")
+                batch = data.get('users', [])
+                users.extend(batch)
+                page_token = data.get('nextPageToken')
+                if not page_token:
+                    break
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Failed to list users in userpool {userpool_id}: {e}")
+                raise UserCreationError(f"List users failed: {e}")
+        logger.info(f"Listed {len(users)} users in userpool {userpool_id}")
+        return users
+
+    def set_others_password(self, user_id: str, password: str, generation_proof: str) -> None:
+        """Set password for a user as an administrator, with operation polling."""
+        url = f"https://organization-manager.api.cloud.yandex.net/organization-manager/v1/idp/users/{user_id}:setOthersPassword"
+        payload = {
+            "passwordSpec": {
+                "password": password,
+                "generationProof": generation_proof,
+            }
+        }
+        try:
+            response = self.session.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            if 'error' in data:
+                logger.error(f"Failed to start setOthersPassword for user {user_id}: {data['error']}")
+                raise UserCreationError(f"setOthersPassword failed: {data['error']['message']}")
+            operation_id = data['id']
+            op_desc = f"setOthersPassword for user {user_id}"
+            self.poll_operation(operation_id, op_desc)
+            logger.info(f"Password reset completed for user {user_id}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to call setOthersPassword for user {user_id}: {e} {response.text if 'response' in locals() else ''}")
+            raise UserCreationError(f"setOthersPassword request failed: {e}")
     
     def _is_valid_ydb_resource_name(self, name: str) -> bool:
         """Validate YDB resource name pattern: /|[a-zA-Z]([-_a-zA-Z0-9]{0,61}[a-zA-Z0-9])?/"""
@@ -525,6 +581,35 @@ class UserCreator:
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to list folders in cloud {cloud_id}: {e}")
             raise UserCreationError(f"Failed to list folders: {e}")
+
+    def list_ydb_databases_in_folder(self, folder_id: str, page_size: int = 1000) -> list:
+        """List YDB databases in a folder (handles pagination)."""
+        url = "https://ydb.api.cloud.yandex.net/ydb/v1/databases"
+        databases = []
+        page_token = None
+        while True:
+            params = {
+                'folderId': folder_id,
+                'pageSize': str(page_size),
+            }
+            if page_token:
+                params['pageToken'] = page_token
+            try:
+                response = self.session.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+                if 'error' in data:
+                    logger.error(f"Failed to list YDB databases in folder {folder_id}: {data['error']}")
+                    raise UserCreationError(f"List YDB databases failed: {data['error']['message']}")
+                databases.extend(data.get('databases', []))
+                page_token = data.get('nextPageToken')
+                if not page_token:
+                    break
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Failed to list YDB databases in folder {folder_id}: {e}")
+                raise UserCreationError(f"List YDB databases failed: {e}")
+        logger.info(f"Listed {len(databases)} YDB databases in folder {folder_id}")
+        return databases
     
     def list_networks(self, folder_id: str) -> list:
         """List all networks in a folder"""
