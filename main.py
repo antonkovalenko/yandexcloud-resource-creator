@@ -126,7 +126,7 @@ def main():
     parser.add_argument(
         '--output-dir',
         required=False,
-        default='.',
+        default='load',
         help='Existing writable directory to write bash scripts (generate-load mode)'
     )
     

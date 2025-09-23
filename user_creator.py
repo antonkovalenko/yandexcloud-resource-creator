@@ -380,7 +380,7 @@ class UserCreator:
             "networkId": network_id,
             "subnetIds": subnet_ids,
             "dedicatedDatabase": {
-                "resourcePresetId": "medium",
+                "resourcePresetId": "small-m8",
                 "storageConfig": {
                     "storageOptions": [
                         {
@@ -442,7 +442,7 @@ class UserCreator:
             "folderId": folder_id,
             "name": database_name,
             "description": description,
-            "resourcePresetId": "medium",
+            "resourcePresetId": "small-m8",
             "storageConfig": {
                 "storageOptions": [
                     {"storageTypeId": "ssd", "groupCount": "1"}
@@ -452,7 +452,7 @@ class UserCreator:
             "networkId": network_id,
             "subnetIds": subnet_ids,
             "dedicatedDatabase": {
-                "resourcePresetId": "medium",
+                "resourcePresetId": "small-m8",
                 "storageConfig": {"storageOptions": [{"storageTypeId": "ssd", "groupCount": "1"}]},
                 "scalePolicy": {"fixedScale": {"size": "1"}},
                 "networkId": network_id,

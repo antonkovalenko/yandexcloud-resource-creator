@@ -11,6 +11,7 @@ import logging
 import random
 import sys
 from typing import Tuple
+import os
 
 from user_creator import UserCreator, UserCreationError
 from validators import (
@@ -295,37 +296,39 @@ def run_ydb_mode(args, user_creator: UserCreator) -> None:
 
 def run_delete_ydb_mode(args, user_creator: UserCreator) -> None:
     validate_cloud_id(args.cloud_id)
-    
-    # Validate required folder-ids parameter for delete-ydb mode
-    if not args.folder_ids:
-        logger.error("--folder-ids is required for delete-ydb mode")
-        sys.exit(1)
 
     logger.info(f"Starting YDB deletion mode for cloud {args.cloud_id}")
-    
-    # Parse folder IDs
-    folder_ids = [fid.strip() for fid in args.folder_ids.split(',') if fid.strip()]
-    logger.info(f"Will delete YDB databases in folders: {folder_ids}")
-    
+
+    # Resolve folders to process
+    if getattr(args, 'folder_ids', None):
+        folder_ids = [fid.strip() for fid in args.folder_ids.split(',') if fid.strip()]
+        folders = [{'id': fid, 'name': fid} for fid in folder_ids]
+        logger.info(f"delete-ydb: using provided folder IDs: {folder_ids}")
+    else:
+        folders = user_creator.list_folders(args.cloud_id)
+        logger.info(f"delete-ydb: listed {len(folders)} folders in cloud {args.cloud_id}")
+
+    # Build skip set
+    skip_set = set()
+    if getattr(args, 'skip_folder_ids', None):
+        skip_set = set(fid.strip() for fid in args.skip_folder_ids.split(',') if fid.strip())
+
     deleted_databases = 0
     pending_ops = []  # list of dicts: {folder_id, folder_name, database_id, operation_id}
-    
+
     # Collect all databases to delete
     databases_to_delete = []
-    for folder_id in folder_ids:
+    for folder in folders:
+        folder_id = folder['id']
+        folder_name = folder.get('name', folder_id)
+        if folder_id in skip_set:
+            logger.info(f"delete-ydb: skipping folder {folder_name} (ID: {folder_id})")
+            continue
         try:
-            # Get folder name for logging
-            folders = user_creator.list_folders(args.cloud_id)
-            folder_name = folder_id  # default to ID
-            for folder in folders:
-                if folder['id'] == folder_id:
-                    folder_name = folder['name']
-                    break
-            
             # List YDB databases in the folder
             databases = user_creator.list_ydb_databases_in_folder(folder_id)
             logger.info(f"Found {len(databases)} YDB databases in folder {folder_name} (ID: {folder_id})")
-            
+
             for db in databases:
                 databases_to_delete.append({
                     'folder_id': folder_id,
@@ -333,13 +336,13 @@ def run_delete_ydb_mode(args, user_creator: UserCreator) -> None:
                     'database_id': db['id'],
                     'database_name': db.get('name', db['id'])
                 })
-                
+
         except UserCreationError as e:
             logger.error(f"Failed to list YDB databases in folder {folder_id}: {e}")
             continue
-    
+
     logger.info(f"Total databases to delete: {len(databases_to_delete)}")
-    
+
     # Start deletion operations with concurrency control
     for db_info in databases_to_delete:
         folder_id = db_info['folder_id']
@@ -581,20 +584,21 @@ def run_generate_load_mode(args, user_creator: UserCreator) -> None:
     if getattr(args, 'skip_folder_ids', None):
         skip_set = set(fid.strip() for fid in args.skip_folder_ids.split(',') if fid.strip())
 
-    # Open output scripts
-    import os
+    # Open init script; mixed/select will be split into batch files
     init_path = os.path.join(args.output_dir, 'init.bash')
-    mixed_path = os.path.join(args.output_dir, 'run-mixed-and-select.bash')
     try:
         init_f = open(init_path, 'w')
-        mixed_f = open(mixed_path, 'w')
         init_f.write("#!/usr/bin/env bash\n")
-        mixed_f.write("#!/usr/bin/env bash\n")
     except Exception as e:
         logger.error(f"Failed to open output scripts: {e}")
         sys.exit(1)
 
     generated = 0
+    batch_size = args.batch_size
+    mixed_f = None
+    batch_no = 1
+    current_batch_count = 0
+    batch_files = []
     try:
         for folder in folders:
             folder_id = folder['id']
@@ -636,11 +640,11 @@ def run_generate_load_mode(args, user_creator: UserCreator) -> None:
             # Generate commands
             init_cmd = (
                 f"ydb --use-metadata-credentials -e {endpoint} -d /ru-central1/{args.cloud_id}/{db_id} "
-                f"workload kv init --auto-partition 0 --max-partitions 1 --min-partitions 1 > init-{db_id} 2>&1 &"
+                f"workload kv init --auto-partition 0 --max-partitions 1 --min-partitions 1 > init-{db_id} 2>&1"
             )
             mixed_cmd = (
                 f"ydb --use-metadata-credentials -e {endpoint} -d /ru-central1/{args.cloud_id}/{db_id} "
-                f"workload kv run mixed -t 100 --seconds {LOAD_DURATION} > mixed-{db_id} 2>&1 &"
+                f"workload kv run mixed -t 50 --seconds {LOAD_DURATION} > mixed-{db_id} 2>&1 &"
             )
             select_cmd = (
                 f"ydb --use-metadata-credentials -e {endpoint} -d /ru-central1/{args.cloud_id}/{db_id} "
@@ -648,24 +652,50 @@ def run_generate_load_mode(args, user_creator: UserCreator) -> None:
             )
 
             init_f.write(init_cmd + "\n")
+
+            # Rotate batch file if needed
+            if mixed_f is None or current_batch_count >= batch_size:
+                # close previous batch file
+                if mixed_f is not None:
+                    try:
+                        mixed_f.close()
+                    except Exception:
+                        pass
+                mixed_path = os.path.join(args.output_dir, f"run-mixed-and-select-{batch_no}.bash")
+                try:
+                    mixed_f = open(mixed_path, 'w')
+                    mixed_f.write("#!/usr/bin/env bash\n")
+                    batch_files.append(mixed_path)
+                except Exception as e:
+                    logger.error(f"Failed to open batch script {mixed_path}: {e}")
+                    sys.exit(1)
+                batch_no += 1
+                current_batch_count = 0
+
             mixed_f.write(mixed_cmd + "\n")
             mixed_f.write(select_cmd + "\n")
             generated += 1
+            current_batch_count += 1
 
     finally:
         try:
             init_f.close()
-            mixed_f.close()
+            if mixed_f is not None:
+                mixed_f.close()
         except Exception:
             pass
 
     # Make executable
     try:
         os.chmod(init_path, 0o755)
-        os.chmod(mixed_path, 0o755)
+        for path in batch_files:
+            try:
+                os.chmod(path, 0o755)
+            except Exception as e:
+                logger.warning(f"Failed to make script executable: {path}: {e}")
     except Exception as e:
         logger.warning(f"Failed to make scripts executable: {e}")
 
-    logger.info(f"generate-load: wrote scripts to {args.output_dir}. Databases targeted: {generated}")
+    logger.info(f"generate-load: wrote init.bash and {len(batch_files)} mixed/select batch script(s) to {args.output_dir}. Databases targeted: {generated}")
 
 
