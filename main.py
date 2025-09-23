@@ -12,6 +12,7 @@ import random
 import sys
 import traceback
 import csv
+import time
 from typing import List, Tuple
 
 from validators import (
@@ -22,7 +23,7 @@ from validators import (
     validate_cloud_id
 )
 from user_creator import UserCreator, UserCreationError
-from modes import run_users_mode, run_ydb_mode, run_reset_password_mode, run_generate_load_mode
+from modes import run_users_mode, run_ydb_mode, run_delete_ydb_mode, run_reset_password_mode, run_generate_load_mode
 
 
 # Configure logging to stdout
@@ -47,9 +48,9 @@ def main():
     # Mode selection
     parser.add_argument(
         '--do',
-        choices=['users', 'ydb', 'reset-password', 'generate-load'],
+        choices=['users', 'create-ydb', 'delete-ydb', 'reset-password', 'generate-load'],
         required=True,
-        help='Operation mode: "users", "ydb", "reset-password", or "generate-load"'
+        help='Operation mode: "users", "create-ydb", "delete-ydb", "reset-password", or "generate-load"'
     )
     
     # User creation mode arguments
@@ -107,13 +108,13 @@ def main():
         default='',
         help='Comma-separated list of folder IDs to create YDB in (if provided, only these folders are processed)'
     )
-
-    # Generate-load mode arguments
+    
+    # Generate-load and delete-ydb mode arguments
     parser.add_argument(
         '--folder-ids',
         required=False,
         default='',
-        help='Comma-separated list of folder IDs to target (generate-load mode)'
+        help='Comma-separated list of folder IDs to target (required for delete-ydb mode, optional for generate-load mode)'
     )
     parser.add_argument(
         '--batch-size',
@@ -129,12 +130,15 @@ def main():
         help='Existing writable directory to write bash scripts (generate-load mode)'
     )
     
+    start_time = time.time()
     args = parser.parse_args()
     
     # Validate IAM token
     iam_token = os.getenv('IAM_TOKEN')
     if not iam_token:
         logger.error("IAM_TOKEN environment variable is required")
+        elapsed = time.time() - start_time
+        logger.info(f"Program run completed in {elapsed:.2f}s")
         sys.exit(1)
     
     try:
@@ -143,8 +147,10 @@ def main():
 
         if args.do == 'users':
             run_users_mode(args, user_creator)
-        elif args.do == 'ydb':
+        elif args.do == 'create-ydb':
             run_ydb_mode(args, user_creator)
+        elif args.do == 'delete-ydb':
+            run_delete_ydb_mode(args, user_creator)
         elif args.do == 'reset-password':
             run_reset_password_mode(args, user_creator)
         elif args.do == 'generate-load':
@@ -159,6 +165,9 @@ def main():
         logger.error(f"Unexpected error: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         sys.exit(1)
+    finally:
+        elapsed = time.time() - start_time
+        logger.info(f"Program run completed in {elapsed:.2f}s")
 
 
 if __name__ == "__main__":

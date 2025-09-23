@@ -28,6 +28,7 @@ class UserCreator:
     ZONES = ["ru-central1-a", "ru-central1-b", "ru-central1-d"]
     MAX_POLL_RETRIES = 5
     VALID_OWN_PASSWORD = 'YdbAdmin$2025'
+    MAX_CONCURRENT_OPERATIONS = 15
     def __init__(self, iam_token: str):
         self.iam_token = iam_token
         self.session = requests.Session()
@@ -362,7 +363,7 @@ class UserCreator:
             "folderId": folder_id,
             "name": database_name,
             "description": description,
-            "resourcePresetId": "medium",
+            "resourcePresetId": "small-m8",
             "storageConfig": {
                 "storageOptions": [
                     {
@@ -478,6 +479,27 @@ class UserCreator:
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to start YDB database {database_name}: {e} {response.text}")
             raise UserCreationError(f"YDB database start failed: {e}")
+
+    def start_ydb_database_deletion(self, database_id: str) -> str:
+        """Start YDB database deletion and return operation ID without waiting for completion"""
+        url = f"https://ydb.api.cloud.yandex.net/ydb/v1/databases/{database_id}"
+        
+        try:
+            response = self.session.delete(url)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'error' in data:
+                logger.error(f"Failed to start YDB database deletion {database_id}: {data['error']}")
+                raise UserCreationError(f"YDB database deletion start failed: {data['error']['message']}")
+            
+            operation_id = data['id']
+            logger.info(f"YDB delete operation started for database {database_id} (op: {operation_id})")
+            return operation_id
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to start YDB database deletion {database_id}: {e} {response.text if 'response' in locals() else ''}")
+            raise UserCreationError(f"YDB database deletion start failed: {e}")
 
     def get_operation_status(self, operation_id: str) -> dict:
         """Fetch operation status once (non-blocking) and return the JSON."""

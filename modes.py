@@ -21,6 +21,7 @@ from validators import (
     validate_cloud_id,
 )
 
+LOAD_DURATION = 36000
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +217,6 @@ def run_ydb_mode(args, user_creator: UserCreator) -> None:
 
     created_databases = 0
     skipped_folders = 0
-    max_concurrent = 5
     pending_ops = []  # list of dicts: {folder_id, folder_name, operation_id}
 
     for folder in target_folders:
@@ -261,9 +261,9 @@ def run_ydb_mode(args, user_creator: UserCreator) -> None:
                     description=f"VPC network for folder {folder_name}",
                 )
 
-            # Flow control: if we already have 5 in-flight ops, poll until one finishes
-            while len(pending_ops) >= max_concurrent:
-                _poll_pending_ops(user_creator, pending_ops)
+            # Flow control: if we already have max concurrent ops in-flight, poll until one finishes
+            while len(pending_ops) >= user_creator.MAX_CONCURRENT_OPERATIONS:
+                created_databases += _poll_pending_ops(user_creator, pending_ops)
 
             # Start YDB create operation (non-blocking)
             op_id = user_creator.start_ydb_database(
@@ -278,6 +278,7 @@ def run_ydb_mode(args, user_creator: UserCreator) -> None:
                 'folder_id': folder_id,
                 'folder_name': folder_name,
                 'operation_id': op_id,
+                'start_time': time.time(),
             })
 
         except UserCreationError as e:
@@ -290,6 +291,144 @@ def run_ydb_mode(args, user_creator: UserCreator) -> None:
         created_databases += created_now
 
     logger.info(f"YDB creation completed. Created {created_databases} databases, skipped {skipped_folders} folders")
+
+
+def run_delete_ydb_mode(args, user_creator: UserCreator) -> None:
+    validate_cloud_id(args.cloud_id)
+    
+    # Validate required folder-ids parameter for delete-ydb mode
+    if not args.folder_ids:
+        logger.error("--folder-ids is required for delete-ydb mode")
+        sys.exit(1)
+
+    logger.info(f"Starting YDB deletion mode for cloud {args.cloud_id}")
+    
+    # Parse folder IDs
+    folder_ids = [fid.strip() for fid in args.folder_ids.split(',') if fid.strip()]
+    logger.info(f"Will delete YDB databases in folders: {folder_ids}")
+    
+    deleted_databases = 0
+    pending_ops = []  # list of dicts: {folder_id, folder_name, database_id, operation_id}
+    
+    # Collect all databases to delete
+    databases_to_delete = []
+    for folder_id in folder_ids:
+        try:
+            # Get folder name for logging
+            folders = user_creator.list_folders(args.cloud_id)
+            folder_name = folder_id  # default to ID
+            for folder in folders:
+                if folder['id'] == folder_id:
+                    folder_name = folder['name']
+                    break
+            
+            # List YDB databases in the folder
+            databases = user_creator.list_ydb_databases_in_folder(folder_id)
+            logger.info(f"Found {len(databases)} YDB databases in folder {folder_name} (ID: {folder_id})")
+            
+            for db in databases:
+                databases_to_delete.append({
+                    'folder_id': folder_id,
+                    'folder_name': folder_name,
+                    'database_id': db['id'],
+                    'database_name': db.get('name', db['id'])
+                })
+                
+        except UserCreationError as e:
+            logger.error(f"Failed to list YDB databases in folder {folder_id}: {e}")
+            continue
+    
+    logger.info(f"Total databases to delete: {len(databases_to_delete)}")
+    
+    # Start deletion operations with concurrency control
+    for db_info in databases_to_delete:
+        folder_id = db_info['folder_id']
+        folder_name = db_info['folder_name']
+        database_id = db_info['database_id']
+        database_name = db_info['database_name']
+        
+        try:
+            # Flow control: if we already have max concurrent ops in-flight, poll until one finishes
+            while len(pending_ops) >= user_creator.MAX_CONCURRENT_OPERATIONS:
+                deleted_databases += _poll_pending_delete_ops(user_creator, pending_ops)
+            
+            # Start YDB delete operation (non-blocking)
+            op_id = user_creator.start_ydb_database_deletion(database_id)
+            
+            pending_ops.append({
+                'folder_id': folder_id,
+                'folder_name': folder_name,
+                'database_id': database_id,
+                'database_name': database_name,
+                'operation_id': op_id,
+                'start_time': time.time(),
+            })
+            
+        except UserCreationError as e:
+            logger.error(f"Failed to start YDB deletion for database {database_name} in folder {folder_name} (ID: {folder_id}): {e}")
+            continue
+    
+    # Finalize any remaining operations
+    while pending_ops:
+        deleted_now = _poll_pending_delete_ops(user_creator, pending_ops)
+        deleted_databases += deleted_now
+    
+    logger.info(f"YDB deletion completed. Deleted {deleted_databases} databases")
+
+
+def _poll_pending_delete_ops(user_creator: UserCreator, pending_ops: list) -> int:
+    """Poll in-flight YDB delete operations once, remove finished, return count of successes."""
+    
+    successes = 0
+    still_pending = []
+    for item in pending_ops:
+        op_id = item['operation_id']
+        folder_name = item['folder_name']
+        database_name = item['database_name']
+        try:
+            data = user_creator.get_operation_status(op_id)
+            done = data.get('done', False)
+            if not done:
+                # If operation reports intermediate error, stop it and log
+                if 'error' in data and data['error']:
+                    err = data['error']
+                    logger.error(
+                        f"YDB delete op {op_id} for database {database_name} in folder {folder_name} has failures: "
+                        f"status={err.get('code')}, message={err.get('message')}, details={err.get('details')}"
+                    )
+                else:
+                    still_pending.append(item)
+                continue
+            
+            # done == True
+            if 'error' in data and data['error']:
+                err = data['error']
+                logger.error(
+                    f"YDB delete op {op_id} for database {database_name} in folder {folder_name} failed: "
+                    f"status={err.get('code')}, message={err.get('message')}, details={err.get('details')}"
+                )
+            else:
+                elapsed = None
+                try:
+                    start = item.get('start_time')
+                    if start:
+                        elapsed = time.time() - start
+                except Exception:
+                    elapsed = None
+                if elapsed is not None:
+                    logger.info(f"YDB delete op {op_id} for database {database_name} in folder {folder_name} completed successfully in {elapsed:.1f}s")
+                else:
+                    logger.info(f"YDB delete op {op_id} for database {database_name} in folder {folder_name} completed successfully")
+                successes += 1
+        except UserCreationError as e:
+            logger.error(f"Polling error for delete op {op_id} (database {database_name} in folder {folder_name}): {e}")
+            # drop this op from pending to avoid infinite loop
+    
+    # Gentle pacing between poll cycles
+    if still_pending:
+        time.sleep(2)
+    pending_ops[:] = still_pending
+    return successes
 
 
 def _poll_pending_ops(user_creator: UserCreator, pending_ops: list) -> int:
@@ -323,7 +462,17 @@ def _poll_pending_ops(user_creator: UserCreator, pending_ops: list) -> int:
                     f"status={err.get('code')}, message={err.get('message')}, details={err.get('details')}"
                 )
             else:
-                logger.info(f"YDB op {op_id} for folder {folder_name} completed successfully")
+                elapsed = None
+                try:
+                    start = item.get('start_time')
+                    if start:
+                        elapsed = time.time() - start
+                except Exception:
+                    elapsed = None
+                if elapsed is not None:
+                    logger.info(f"YDB op {op_id} for folder {folder_name} completed successfully in {elapsed:.1f}s")
+                else:
+                    logger.info(f"YDB op {op_id} for folder {folder_name} completed successfully")
                 successes += 1
         except UserCreationError as e:
             logger.error(f"Polling error for op {op_id} (folder {folder_name}): {e}")
@@ -491,11 +640,11 @@ def run_generate_load_mode(args, user_creator: UserCreator) -> None:
             )
             mixed_cmd = (
                 f"ydb --use-metadata-credentials -e {endpoint} -d /ru-central1/{args.cloud_id}/{db_id} "
-                f"workload kv run mixed -t 300 --seconds 3600 > mixed-{db_id} 2>&1 &"
+                f"workload kv run mixed -t 100 --seconds {LOAD_DURATION} > mixed-{db_id} 2>&1 &"
             )
             select_cmd = (
                 f"ydb --use-metadata-credentials -e {endpoint} -d /ru-central1/{args.cloud_id}/{db_id} "
-                f"workload kv run select --threads 100 --seconds 3600 --rows 100 > mixed-{db_id} 2>&1 &"
+                f"workload kv run select --threads 10 --seconds {LOAD_DURATION} --rows 1000 > mixed-{db_id} 2>&1 &"
             )
 
             init_f.write(init_cmd + "\n")
