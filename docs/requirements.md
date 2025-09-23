@@ -125,5 +125,54 @@ Response will be like
   }
 }
 
-### Delete users
+### Reset passwords
+
+Program must support resetting passwords for users in a userpool.
+
+- If a list of user IDs is provided, reset for those users
+- If not provided, list all users in the userpool and reset for each
+- For each user:
+  - Generate a password via `POST .../v1/idp/users:generatePassword`
+  - Call `POST .../v1/idp/users/{userId}:setOthersPassword` and poll the operation until done
+
+Output results (user id, username, password) to CSV as users are processed.
+
+### Create VPC and YDB database
+
+Program must support creating network infrastructure and YDB databases per folder.
+
+- For each folder, first check if a suitable VPC with subnets across required zones exists; reuse if found
+- If no such VPC exists, create one network and three subnets (zones: ru-central1-a, ru-central1-b, ru-central1-d)
+- Before creating YDB, list existing databases in the folder via `GET https://ydb.api.cloud.yandex.net/ydb/v1/databases`
+- If any database has `storageConfig.storageOptions[*].groupCount > 1`, skip creating a new YDB in that folder
+- Otherwise, create a YDB dedicated database and poll the operation until done
+
+YDB creation must support:
+
+- Processing only folders passed via command line option
+- Skipping folders passed via command line option
+- Up to 5 concurrent create operations with regular polling (2s) and retries on transient errors
+
+### Generate load scripts for YDB
+
+Program must generate bash scripts to run kv workload via ydb CLI for existing YDB databases with storage groups.
+
+Inputs:
+
+- cloud-id (required)
+- folder-ids (optional, comma-separated)
+- skip-folder-ids (optional, comma-separated)
+- batch-size (optional, default 16, 1..32)
+- output-dir (required, existing writable dir)
+
+Behavior:
+
+- Determine folders from folder-ids or list all folders in the cloud
+- Skip folders in skip-folder-ids
+- For the first YDB found in a folder with storage groups (groupCount > 0), generate commands:
+  - `ydb ... workload kv init ... > init-<db_id> 2>&1 &`
+  - `ydb ... workload kv run mixed -t 300 --seconds 3600 > mixed-<db_id> 2>&1 &`
+  - `ydb ... workload kv run select --threads 100 --seconds 3600 --rows 100 > mixed-<db_id> 2>&1 &`
+- Write init commands to `init.bash`, mixed/select to `run-mixed-and-select.bash`
+- Add bash shebang and make scripts executable
 

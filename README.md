@@ -1,14 +1,16 @@
-# Yandex Cloud User Creation CLI Tool
+# Yandex Cloud Resource Creator
 
-A Python CLI tool for creating users in Yandex Cloud using the organization-manager API.
+A Python CLI for creating and managing Yandex Cloud resources: users, folders/access, VPC networks, YDB databases, password resets, and load script generation.
 
 ## Features
 
-- Create multiple users in Yandex Cloud with a single command
-- Generate unique names from Lord of the Rings and War and Peace characters
-- Automatic password generation via Yandex Cloud API
-- Comprehensive parameter validation
-- Detailed logging to stdout
+- Create users with unique names, validated parameters, and CSV streaming output
+- Create personal folders, grant folder Editor and cloud membership access
+- Create VPC with 3 subnets (one per zone), or reuse existing VPC
+- Create YDB databases (skips if one with storage groups already exists)
+- Reset passwords for specified or all users in a userpool (CSV streaming output)
+- Generate load scripts for YDB via ydb CLI
+- Robust operation polling with retries and timing logs
 
 ## Prerequisites
 
@@ -22,11 +24,11 @@ A Python CLI tool for creating users in Yandex Cloud using the organization-mana
 
 ```bash
 # If using git
-git clone <repository-url>
-cd neuroscale-2025
+git clone https://github.com/antonkovalenko/yandexcloud-resource-creator.git
+cd yandexcloud-resource-creator
 
 # Or simply navigate to the project directory if you have the files
-cd /path/to/neuroscale-2025
+cd /path/to/yandexcloud-resource-creator
 ```
 
 ### 2. Create and activate a virtual environment
@@ -67,35 +69,70 @@ export IAM_TOKEN="your_iam_token_here"
 
 ## Usage
 
-### Basic Command
+All commands require an IAM token in the environment:
 
 ```bash
-python main.py --userpool-id <pool_id> --num-users <number> --domain <domain>
+export IAM_TOKEN=your_token
 ```
 
-### Parameters
+### Modes
 
-- `--userpool-id`: User pool ID (required)
-  - Must be a string of letters and digits
-  - Cannot be empty
-  - Cannot be longer than 32 characters
+- users: create users, folders, access; stream output CSV
+- ydb: create VPC+subnets (if needed) and YDB databases; supports targeting folders
+- reset-password: reset user passwords; stream output CSV
+- generate-load: generate ydb CLI load scripts for existing YDB databases
 
-- `--num-users`: Number of users to create (required)
-  - Must be between 1 and 100
-  - Cannot be zero
+Common flags:
+- `--cloud-id <id>`: Cloud ID
+- `--created-users-file <path>`: CSV output (users and reset-password modes)
 
-- `--domain`: Domain name for user emails (required)
-  - Must be a valid internet domain syntax
-
-### Examples
-
+#### users
 ```bash
-# Create 5 users in userpool "myuserpool" with domain "example.com"
-python main.py --userpool-id myuserpool --num-users 5 --domain example.com
-
-# Create 10 users in userpool "test123" with domain "company.org"
-python main.py --userpool-id test123 --num-users 10 --domain company.org
+python main.py --do users \
+  --userpool-id <pool_id> \
+  --num-users <1..100> \
+  --domain <domain> \
+  --cloud-id <cloud_id> \
+  --created-users-file created_users.csv
 ```
+
+#### ydb
+```bash
+# All folders (except skips)
+python main.py --do ydb --cloud-id <cloud_id> \
+  --skip-folder-ids folderA,folderB
+
+# Only specified folders
+python main.py --do ydb --cloud-id <cloud_id> \
+  --create-ydb-in-folders folderX,folderY
+```
+
+Behavior:
+- Reuses existing VPC with subnets across required zones; otherwise creates one
+- Skips folder if a YDB with storageConfig.storageOptions groupCount>1 exists
+
+#### reset-password
+```bash
+# Specific users
+python main.py --do reset-password --userpool-id <pool_id> \
+  --user-ids user1,user2 --created-users-file reset_results.csv
+
+# All users in userpool
+python main.py --do reset-password --userpool-id <pool_id> \
+  --created-users-file reset_results.csv
+```
+
+#### generate-load
+```bash
+python main.py --do generate-load --cloud-id <cloud_id> \
+  --folder-ids folderA,folderB \
+  --skip-folder-ids folderC \
+  --batch-size 16 \
+  --output-dir ./scripts
+```
+Outputs two executable scripts in output-dir:
+- `init.bash`: ydb workload kv init commands
+- `run-mixed-and-select.bash`: ydb workload kv mixed and select commands
 
 ### Sample Output
 
@@ -158,10 +195,15 @@ Run the tool with `--help` to see all available options:
 python main.py --help
 ```
 
-## API Endpoints Used
+## API Endpoints Used (selection)
 
-- **Password Generation**: `POST https://organization-manager.api.cloud.yandex.net/organization-manager/v1/idp/users:generatePassword`
-- **User Creation**: `POST https://organization-manager.api.cloud.yandex.net/organization-manager/v1/idp/users`
+- Password Generation: `POST .../v1/idp/users:generatePassword`
+- User Creation: `POST .../v1/idp/users`
+- Folder Creation: `POST https://resource-manager.api.cloud.yandex.net/resource-manager/v1/folders`
+- Folder Access: `POST .../v1/folders/{id}:setAccessBindings`
+- Cloud Access Update: `POST .../v1/clouds/{id}:updateAccessBindings`
+- VPC Networks/Subnets: `POST https://vpc.api.cloud.yandex.net/vpc/v1/networks`, `POST .../v1/subnets`
+- YDB Create/List: `POST https://ydb.api.cloud.yandex.net/ydb/v1/databases`, `GET .../v1/databases`
 
 ## Security Notes
 
