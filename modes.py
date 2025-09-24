@@ -644,7 +644,7 @@ def run_generate_load_mode(args, user_creator: UserCreator) -> None:
             )
             mixed_cmd = (
                 f"ydb --use-metadata-credentials -e {endpoint} -d /ru-central1/{args.cloud_id}/{db_id} "
-                f"workload kv run mixed -t 50 --seconds {LOAD_DURATION} > mixed-{db_id} 2>&1 &"
+                f"workload kv run mixed -t 100 --seconds {LOAD_DURATION} > mixed-{db_id} 2>&1 &"
             )
             select_cmd = (
                 f"ydb --use-metadata-credentials -e {endpoint} -d /ru-central1/{args.cloud_id}/{db_id} "

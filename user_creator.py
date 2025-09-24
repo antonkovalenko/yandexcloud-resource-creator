@@ -357,74 +357,20 @@ class UserCreator:
         if not self._is_valid_ydb_resource_name(database_name):
             raise UserCreationError(f"Invalid database name '{database_name}'. Must match pattern /|[a-zA-Z]([-_a-zA-Z0-9]{{0,61}}[a-zA-Z0-9])?/")
         
-        url = "https://ydb.api.cloud.yandex.net/ydb/v1/databases"
-        
-        payload = {
-            "folderId": folder_id,
-            "name": database_name,
-            "description": description,
-            "resourcePresetId": "small-m8",
-            "storageConfig": {
-                "storageOptions": [
-                    {
-                        "storageTypeId": "ssd",
-                        "groupCount": "1"
-                    }
-                ]
-            },
-            "scalePolicy": {
-                "fixedScale": {
-                    "size": "1"
-                }
-            },
-            "networkId": network_id,
-            "subnetIds": subnet_ids,
-            "dedicatedDatabase": {
-                "resourcePresetId": "small-m8",
-                "storageConfig": {
-                    "storageOptions": [
-                        {
-                            "storageTypeId": "ssd",
-                            "groupCount": "1"
-                        }
-                    ]
-                },
-                "scalePolicy": {
-                    "fixedScale": {
-                        "size": "1"
-                    }
-                },
-                "networkId": network_id,
-                "subnetIds": subnet_ids,
-                "assignPublicIps": False
-            },
-            "assignPublicIps": False,
-            "labels": {}
-        }
-        
-        try:
-            response = self.session.post(url, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            
-            if 'error' in data:
-                logger.error(f"Failed to create YDB database {database_name}: {data['error']}")
-                raise UserCreationError(f"YDB database creation failed: {data['error']['message']}")
-            
-            # Get operation ID and poll until completion
-            operation_id = data['id']
-            operation_description = f"YDB database creation for {database_name}"
-            
-            # Poll the operation until it's complete
-            operation_response = self.poll_operation(operation_id, operation_description)
-            
-            database_id = operation_response['id']
-            logger.info(f"YDB database created successfully: {database_name} (ID: {database_id})")
-            return database_id
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to create YDB database {database_name}: {e} {response.text}")
-            raise UserCreationError(f"YDB database creation failed: {e}")
+        # Build payload and start operation via shared helper, then poll to completion
+        payload = self._build_ydb_create_payload(
+            folder_id=folder_id,
+            network_id=network_id,
+            subnet_ids=subnet_ids,
+            database_name=database_name,
+            description=description,
+        )
+        operation_id = self._start_ydb_database_with_payload(payload, database_name)
+        operation_description = f"YDB database creation for {database_name}"
+        operation_response = self.poll_operation(operation_id, operation_description)
+        database_id = operation_response['id']
+        logger.info(f"YDB database created successfully: {database_name} (ID: {database_id})")
+        return database_id
 
     def start_ydb_database(self, folder_id: str, network_id: str, subnet_ids: list, database_name: str = None, description: str = None) -> str:
         """Start YDB database creation and return operation ID without waiting for completion"""
@@ -436,9 +382,18 @@ class UserCreator:
         if not self._is_valid_ydb_resource_name(database_name):
             raise UserCreationError(f"Invalid database name '{database_name}'. Must match pattern /|[a-zA-Z]([-_a-zA-Z0-9]{0,61}[a-zA-Z0-9])?/")
 
-        url = "https://ydb.api.cloud.yandex.net/ydb/v1/databases"
+        payload = self._build_ydb_create_payload(
+            folder_id=folder_id,
+            network_id=network_id,
+            subnet_ids=subnet_ids,
+            database_name=database_name,
+            description=description,
+        )
+        return self._start_ydb_database_with_payload(payload, database_name)
 
-        payload = {
+    def _build_ydb_create_payload(self, folder_id: str, network_id: str, subnet_ids: list, database_name: str, description: str) -> dict:
+        """Build YDB create payload (shared by start and create)."""
+        return {
             "folderId": folder_id,
             "name": database_name,
             "description": description,
@@ -463,19 +418,19 @@ class UserCreator:
             "labels": {},
         }
 
+    def _start_ydb_database_with_payload(self, payload: dict, database_name: str) -> str:
+        """POST YDB create with given payload and return operation id."""
+        url = "https://ydb.api.cloud.yandex.net/ydb/v1/databases"
         try:
             response = self.session.post(url, json=payload)
             response.raise_for_status()
             data = response.json()
-
             if 'error' in data:
                 logger.error(f"Failed to start YDB database {database_name}: {data['error']}")
                 raise UserCreationError(f"YDB database start failed: {data['error']['message']}")
-
             operation_id = data['id']
             logger.info(f"YDB create operation started for {database_name} (op: {operation_id})")
             return operation_id
-
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to start YDB database {database_name}: {e} {response.text}")
             raise UserCreationError(f"YDB database start failed: {e}")
