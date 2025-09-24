@@ -9,26 +9,18 @@ using the Yandex Cloud organization-manager and resource-manager APIs.
 import logging
 import re
 import requests
-import sys
 import time
-from typing import Tuple
+from typing import Tuple, List, Dict, Any, Optional
 
+from config import Constants
+from exceptions import UserCreationError, OperationError, NetworkError
 
 logger = logging.getLogger(__name__)
 
 
-class UserCreationError(Exception):
-    """Custom exception for user creation errors"""
-    pass
-
-
 class UserCreator:
     """Handles user creation, folder creation, and access management in Yandex Cloud"""
-    # Availability zones used across VPC/subnet creation and checks
-    ZONES = ["ru-central1-a", "ru-central1-b", "ru-central1-d"]
-    MAX_POLL_RETRIES = 5
-    VALID_OWN_PASSWORD = 'YdbAdmin$2025'
-    MAX_CONCURRENT_OPERATIONS = 15
+    
     def __init__(self, iam_token: str):
         self.iam_token = iam_token
         self.session = requests.Session()
@@ -252,13 +244,13 @@ class UserCreator:
         network_id = self._create_network(folder_id, network_name, description)
         
         # Create 3 subnets in different zones
-        zones = self.ZONES
+        zones = Constants.YDB_AVAILABILITY_ZONES
         subnet_ids = []
         
         for i, zone in enumerate(zones, 1):
             subnet_name = f"{network_name}-subnet-{zone}"
             subnet_description = f"Subnet in {zone} for {network_name}"
-            cidr_block = f"192.168.{i}.0/24"  # 192.168.1.0/24, 192.168.2.0/24, 192.168.3.0/24
+            cidr_block = Constants.VPC_CIDR_BLOCKS[i-1]
             
             subnet_id = self._create_subnet(
                 folder_id=folder_id,
@@ -397,19 +389,19 @@ class UserCreator:
             "folderId": folder_id,
             "name": database_name,
             "description": description,
-            "resourcePresetId": "small-m8",
+            "resourcePresetId": Constants.YDB_RESOURCE_PRESET,
             "storageConfig": {
                 "storageOptions": [
-                    {"storageTypeId": "ssd", "groupCount": "1"}
+                    {"storageTypeId": Constants.YDB_STORAGE_TYPE, "groupCount": Constants.YDB_GROUP_COUNT}
                 ]
             },
-            "scalePolicy": {"fixedScale": {"size": "1"}},
+            "scalePolicy": {"fixedScale": {"size": Constants.YDB_SCALE_SIZE}},
             "networkId": network_id,
             "subnetIds": subnet_ids,
             "dedicatedDatabase": {
-                "resourcePresetId": "small-m8",
-                "storageConfig": {"storageOptions": [{"storageTypeId": "ssd", "groupCount": "1"}]},
-                "scalePolicy": {"fixedScale": {"size": "1"}},
+                "resourcePresetId": Constants.YDB_RESOURCE_PRESET,
+                "storageConfig": {"storageOptions": [{"storageTypeId": Constants.YDB_STORAGE_TYPE, "groupCount": Constants.YDB_GROUP_COUNT}]},
+                "scalePolicy": {"fixedScale": {"size": Constants.YDB_SCALE_SIZE}},
                 "networkId": network_id,
                 "subnetIds": subnet_ids,
                 "assignPublicIps": False,
@@ -459,18 +451,18 @@ class UserCreator:
     def get_operation_status(self, operation_id: str) -> dict:
         """Fetch operation status once (non-blocking) and return the JSON."""
         url = f"https://operation.api.cloud.yandex.net/operations/{operation_id}"
-        for attempt in range(1, self.MAX_POLL_RETRIES + 1):
+        for attempt in range(1, Constants.MAX_POLL_RETRIES + 1):
             try:
                 response = self.session.get(url)
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as e:
-                if attempt >= self.MAX_POLL_RETRIES:
+                if attempt >= Constants.MAX_POLL_RETRIES:
                     logger.error(f"Failed to fetch operation status for {operation_id} after {attempt} attempts: {e}")
                     raise UserCreationError(f"Operation status fetch failed: {e}")
                 delay = 2 ** (attempt - 1)
                 logger.warning(
-                    f"Fetch status retry {attempt}/{self.MAX_POLL_RETRIES} for op {operation_id} in {delay}s due to error: {e}"
+                    f"Fetch status retry {attempt}/{Constants.MAX_POLL_RETRIES} for op {operation_id} in {delay}s due to error: {e}"
                 )
                 time.sleep(delay)
 
@@ -591,8 +583,6 @@ class UserCreator:
     def list_networks(self, folder_id: str) -> list:
         """List all networks in a folder"""
         url = "https://vpc.api.cloud.yandex.net/vpc/v1/networks"
-        #always return list with this only element enp405qc235ru1ci9vdj
-        folder_id = 'b1gofk0fh5qlc1plb7oe'
         
         params = {
             'folderId': folder_id
@@ -637,7 +627,7 @@ class UserCreator:
     
     def check_existing_vpc(self, folder_id: str) -> tuple:
         """Check if folder has existing VPC with subnets in all required zones"""
-        required_zones = self.ZONES
+        required_zones = Constants.YDB_AVAILABILITY_ZONES
         
         try:
             # List networks in the folder
@@ -697,7 +687,7 @@ class UserCreator:
             try:
                 # GET with retries and backoff
                 last_error = None
-                for attempt in range(1, self.MAX_POLL_RETRIES + 1):
+                for attempt in range(1, Constants.MAX_POLL_RETRIES + 1):
                     try:
                         response = self.session.get(url)
                         response.raise_for_status()
@@ -705,11 +695,11 @@ class UserCreator:
                         break
                     except requests.exceptions.RequestException as e:
                         last_error = e
-                        if attempt >= self.MAX_POLL_RETRIES:
+                        if attempt >= Constants.MAX_POLL_RETRIES:
                             raise
                         delay = 2 ** (attempt - 1)
                         logger.warning(
-                            f"Poll retry {attempt}/{self.MAX_POLL_RETRIES} for {operation_description} (ID: {operation_id}) in {delay}s due to error: {e}"
+                            f"Poll retry {attempt}/{Constants.MAX_POLL_RETRIES} for {operation_description} (ID: {operation_id}) in {delay}s due to error: {e}"
                         )
                         time.sleep(delay)
                 
